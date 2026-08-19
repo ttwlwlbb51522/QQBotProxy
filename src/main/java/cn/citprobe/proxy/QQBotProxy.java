@@ -1,5 +1,6 @@
 package cn.citprobe.proxy;
 
+import cn.citprobe.Config;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
@@ -16,10 +17,11 @@ import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
-import java.util.ArrayList;
-import java.util.Set;
+import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 public class QQBotProxy {
 
@@ -31,6 +33,10 @@ public class QQBotProxy {
 
     private final ObjectMapper mapper = new ObjectMapper();
     private final HttpClient httpClient = HttpClient.newHttpClient();
+    private final String secret;
+    // 运行标志，用于优雅退出
+    private volatile boolean running = true;
+
 
     // access_token 缓存
     private String accessToken;
@@ -53,12 +59,9 @@ public class QQBotProxy {
 
     public static void main(String[] args) {
         String configPath;
-
         if (args.length > 0) {
-            // 命令行指定了配置文件路径
             configPath = args[0];
         } else {
-            // 默认：与 jar 包同级的 config.json
             configPath = getJarDir() + File.separator + "config.json";
         }
 
@@ -72,10 +75,29 @@ public class QQBotProxy {
                 config.getAppSecret(),
                 config.getIntents(),
                 config.getAdminIds(),
-                config.getExternalPort()
+                config.getExternalPort(),
+                config.getSecret()
         );
+
+        // 后台监听输入，输入 stop 时退出
+        Thread inputThread = new Thread(() -> {
+            Scanner sc = new Scanner(System.in);
+            while (true) {
+                String line = sc.nextLine().trim();
+                if ("stop".equalsIgnoreCase(line)) {
+                    bot.stop();
+                    return;
+                }
+            }
+        });
+        inputThread.setDaemon(true);
+        inputThread.start();
+
         bot.run();
+        System.out.println("程序已退出");
+        System.exit(0);
     }
+
 
     /**
      * 获取 jar 包所在目录。
@@ -93,12 +115,13 @@ public class QQBotProxy {
         }
     }
 
-    public QQBotProxy(String appId, String appSecret, long intents, Set<String> adminIds, int externalPort) {
+    public QQBotProxy(String appId, String appSecret, long intents, Set<String> adminIds, int externalPort, String secret) {
         this.appId = appId;
         this.appSecret = appSecret;
         this.intents = intents;
         this.adminIds = adminIds;
         this.externalPort = externalPort;
+        this.secret = secret;
     }
 
     // ==================== QQ 官方鉴权 ====================
@@ -214,6 +237,67 @@ public class QQBotProxy {
         }
     }
 
+    /**
+     * 将消息内容中的 @用户 转换为对应的 openid。
+     * - @机器人：替换为空（机器人是被调用者，不是目标）
+     * - @普通用户：替换为该用户的 openid
+     *
+     * 例如："/point @张三"  →  "/point abcde12345"
+     */
+    private String replaceMentions(String content, JsonNode d) {
+        JsonNode mentions = d.path("mentions");
+
+        Map<String, String> idMap = new HashMap<>();     // 用户id -> openid
+        Map<String, String> nameMap = new HashMap<>();   // 用户名 -> openid
+        Set<String> botIds = new HashSet<>();
+        Set<String> botNames = new HashSet<>();
+
+        for (JsonNode m : mentions) {
+            String openid = m.path("member_openid").asText("");
+            if (openid.isEmpty()) {
+                openid = m.path("id").asText("");
+            }
+            String id = m.path("id").asText("");
+            String username = m.path("username").asText("");
+            boolean isBot = m.path("is_you").asBoolean(false) || m.path("bot").asBoolean(false);
+
+            if (isBot) {
+                if (!id.isEmpty()) botIds.add(id);
+                if (!username.isEmpty()) botNames.add(username);
+            } else {
+                if (!id.isEmpty()) idMap.put(id, openid);
+                if (!username.isEmpty()) nameMap.put(username, openid);
+            }
+        }
+
+        // 1. 替换 <@id>、<@!id> 形式
+        Matcher matcher = Pattern.compile("<@!?([^>]+)>").matcher(content);
+        StringBuffer sb = new StringBuffer();
+        while (matcher.find()) {
+            String inner = matcher.group(1);
+            if (botIds.contains(inner)) {
+                matcher.appendReplacement(sb, "");                       // 机器人，去掉
+            } else {
+                String openid = idMap.get(inner);
+                matcher.appendReplacement(sb, openid == null ? "" : Matcher.quoteReplacement(openid));
+            }
+        }
+        matcher.appendTail(sb);
+        content = sb.toString();
+
+        // 2. 替换纯文本 @机器人名，去掉
+        for (String botName : botNames) {
+            content = content.replace("@" + botName, "");
+        }
+
+        // 3. 替换纯文本 @用户名，换成 openid
+        for (Map.Entry<String, String> e : nameMap.entrySet()) {
+            content = content.replace("@" + e.getKey(), e.getValue());
+        }
+
+        return content.strip();
+    }
+
     private void sendIdentify() throws Exception {
         ObjectNode d = mapper.createObjectNode();
         d.put("token", "QQBot " + getAccessToken());
@@ -327,14 +411,15 @@ public class QQBotProxy {
         u.setOpenid(memberOpenid.isEmpty() ? uid : memberOpenid);
         u.setBotAdmin(adminIds.contains(uid) || adminIds.contains(u.getOpenid()));
 
-        u.setMessage(cleanContent(d.path("content").asText("")));
+        // 关键修改：@ 处理转 openid
+        u.setMessage(replaceMentions(d.path("content").asText(""), d));
+
         u.setGroupOpenid(d.path("group_openid").asText(null));
         u.setMsgId(d.has("id") ? d.get("id").asText() : null);
         u.setMsgSeq((d.has("msg_seq") && d.get("msg_seq").isNumber()) ? d.get("msg_seq").asLong() : null);
         u.setTimestamp(System.currentTimeMillis());
         return u;
     }
-
 
     private String cleanContent(String content) {
         content = content.strip();
@@ -456,10 +541,12 @@ public class QQBotProxy {
 
     private static class ExternalApiServer extends WebSocketServer {
         private final QQBotProxy bot;
+        private final String secret;
 
-        public ExternalApiServer(int port, QQBotProxy bot) {
+        public ExternalApiServer(int port, QQBotProxy bot, String secret) {
             super(new InetSocketAddress(port));
             this.bot = bot;
+            this.secret = secret;
         }
 
         @Override
@@ -469,7 +556,15 @@ public class QQBotProxy {
 
         @Override
         public void onOpen(WebSocket conn, ClientHandshake handshake) {
-            System.out.println("外部项目已连接: " + conn.getRemoteSocketAddress());
+            String provided = handshake.getFieldValue("X-Forwarding-Secret");
+
+            if (secret == null || !secret.equals(provided)) {
+                System.out.println("外部项目密钥校验失败，拒绝连接: " + conn.getRemoteSocketAddress());
+                conn.close(1008, "forbidden: secret mismatch");
+                return;
+            }
+
+            System.out.println("外部项目已连接(密钥校验通过): " + conn.getRemoteSocketAddress());
         }
 
         @Override
@@ -494,18 +589,19 @@ public class QQBotProxy {
         }
     }
 
+
     // ==================== 启动 ====================
 
     public void run() {
         try {
-            externalServer = new ExternalApiServer(externalPort, this);
+            externalServer = new ExternalApiServer(externalPort, this, secret);
             externalServer.start();
         } catch (Exception e) {
             System.out.println("外部 API 服务启动失败: " + e.getMessage());
             return;
         }
 
-        while (true) {
+        while (running) {
             try {
                 getAccessToken();
                 connect();
@@ -513,11 +609,42 @@ public class QQBotProxy {
                 System.out.println("运行异常: " + e.getMessage());
             }
 
+            if (!running) {
+                break;
+            }
+
             System.out.println("QQ 连接已断开，5 秒后重连...");
             try {
                 Thread.sleep(5000);
             } catch (InterruptedException ignored) {
             }
+        }
+
+        System.out.println("中转站已停止");
+    }
+
+    /**
+     * 停止中转站：关闭官方连接和对外服务，退出运行循环。
+     */
+    public void stop() {
+        System.out.println("收到 stop 指令，正在停止中转站...");
+
+        running = false;
+
+        // 关闭官方 WebSocket 连接，触发 connect() 返回
+        try {
+            if (ws != null) {
+                ws.close();
+            }
+        } catch (Exception ignored) {
+        }
+
+        // 停止对外 WebSocket 服务
+        try {
+            if (externalServer != null) {
+                externalServer.stop(1000);
+            }
+        } catch (Exception ignored) {
         }
     }
 

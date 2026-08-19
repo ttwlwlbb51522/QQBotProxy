@@ -5,8 +5,8 @@
     <modelVersion>4.0.0</modelVersion>
 
     <groupId>cn.citprobe</groupId>
-    <artifactId>qqbotproxy</artifactId>
-    <version>1.0.0</version>
+    <artifactId>QQBotProxy</artifactId>
+    <version>1.1.0</version>
     <packaging>jar</packaging>
 
     <properties>
